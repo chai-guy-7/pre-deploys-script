@@ -216,16 +216,6 @@ If you see an error about the transaction already existing, it likely means the 
 
 Your funder account doesn't have enough balance. Make sure it has sufficient ETH/base token to cover all deployment funding requirements (typically 0.17 ETH total for all 4 contracts).
 
-## Building Bytecode Artifacts
-
-If you need to regenerate the bytecode artifacts (e.g., after updating contract sources):
-
-```bash
-npm run build:bytecodes
-```
-
-This will compile all contracts and update `artifacts/predeploy-bytecodes.json`.
-
 ## References
 
 - [Arachnid Deterministic Deployment Proxy](https://github.com/Arachnid/deterministic-deployment-proxy)
