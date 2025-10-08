@@ -1,0 +1,21 @@
+{
+  "name": "pre-deploys-script",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build:bytecodes": "node --experimental-loader ts-node/esm scripts/build-bytecodes.ts",
+    "deploy": "node --experimental-loader ts-node/esm scripts/deploy-predeploys.ts"
+  },
+  "dependencies": {
+    "commander": "^11.1.0",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "solc": "^0.8.23",
+    "ts-node": "^10.9.2",
+    "tslib": "^2.6.2",
+    "typescript": "^5.5.4"
+  }
+}
