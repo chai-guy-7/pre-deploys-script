@@ -23,6 +23,7 @@ interface CliOptions {
   dryRun?: boolean
   confirm?: boolean
   gasEstimate?: boolean
+  gasBuffer: number
 }
 
 interface GasEstimateResult {
@@ -134,6 +135,7 @@ const program = new Command()
   .option('--dry-run', 'Print actions without broadcasting transactions', false)
   .option('--confirm', 'Skip interactive confirmation prompt', false)
   .option('--gas-estimate', 'Estimate actual gas costs on L2 and compare with hardcoded funding amounts (requires --l2-rpc)', false)
+  .option('--gas-buffer <percent>', 'Extra % added on top of estimated gas cost when funding deployer addresses (default: 20)', (v) => parseInt(v, 10), 20)
 
 program.parse(process.argv)
 const options = program.opts<CliOptions>()
@@ -282,8 +284,9 @@ async function deployOnL2(params: {
   rpcUrl?: string
   funderPrivateKey?: string
   dryRun: boolean
+  gasBuffer: number
 }): Promise<DeploymentSummary[]> {
-  const { deployments, rpcUrl, funderPrivateKey, dryRun } = params
+  const { deployments, rpcUrl, funderPrivateKey, dryRun, gasBuffer } = params
 
   if (dryRun) {
     console.log(`\n[L2] Dry run mode.`)
@@ -329,19 +332,42 @@ async function deployOnL2(params: {
       continue
     }
 
+    // Estimate actual gas cost for this deployment and use that instead of the
+    // hardcoded fundingAmount, so we don't over-fund the deployer address.
+    const parsedTx = Transaction.from(deployment.rawTransaction)
+    const txGasPrice = parsedTx.gasPrice ?? BigInt(0)
+    const txGasLimit = BigInt(parsedTx.gasLimit)
+    let requiredWei: bigint
+
+    try {
+      const estimatedGas = await provider.estimateGas({
+        from: deployment.fundingAddress,
+        data: parsedTx.data,
+        value: parsedTx.value
+      })
+      // Apply the configurable buffer on top of the estimate
+      const bufferedGas = estimatedGas * BigInt(100 + gasBuffer) / BigInt(100)
+      requiredWei = bufferedGas * txGasPrice
+      console.log(`  Gas estimate: ${estimatedGas.toLocaleString()} (+ ${gasBuffer}% buffer → funding ${formatEther(requiredWei)} ETH vs hardcoded ${deployment.fundingAmount} ETH)`)
+    } catch (err: any) {
+      // Fall back to the hardcoded amount if estimation fails
+      requiredWei = parseEther(deployment.fundingAmount)
+      console.log(`  ⚠ Gas estimation failed (${err.message}), falling back to hardcoded ${deployment.fundingAmount} ETH`)
+    }
+
     // Check funding address balance
     const balance = await checkBalance(provider, deployment.fundingAddress)
-    const requiredWei = parseEther(deployment.fundingAmount)
     const isFunded = balance >= requiredWei
 
-    console.log(`  Funding balance: ${formatEther(balance)} ETH (required: ${deployment.fundingAmount} ETH)`)
+    console.log(`  Funding balance: ${formatEther(balance)} ETH (required: ${formatEther(requiredWei)} ETH)`)
 
     if (!isFunded) {
-      console.log(`  ⚠ Insufficient balance. Funding address with ${deployment.fundingAmount} ETH...`)
+      const topUp = requiredWei - balance
+      console.log(`  ⚠ Insufficient balance. Topping up deployer with ${formatEther(topUp)} ETH...`)
       try {
         const fundingTx = await funderWallet.sendTransaction({
           to: deployment.fundingAddress,
-          value: requiredWei
+          value: topUp
         })
         console.log(`  📤 Funding tx sent: ${fundingTx.hash}`)
         await fundingTx.wait()
@@ -455,6 +481,7 @@ async function main() {
   console.log(`  L2 RPC: ${options.l2Rpc ?? 'n/a'}`)
   console.log(`  Dry run: ${options.dryRun ? 'yes' : 'no'}`)
   console.log(`  Gas estimate: ${options.gasEstimate ? 'yes' : 'no'}`)
+  console.log(`  Gas buffer: ${options.gasBuffer}%`)
 
   console.log('\nContracts to deploy:')
   for (const deployment of deployments) {
@@ -551,7 +578,8 @@ async function main() {
     deployments,
     rpcUrl: options.l2Rpc,
     funderPrivateKey: options.funderPrivateKey ? normalizePrivateKey(options.funderPrivateKey) : undefined,
-    dryRun: Boolean(options.dryRun)
+    dryRun: Boolean(options.dryRun),
+    gasBuffer: options.gasBuffer
   })
 
   console.log('\n' + '='.repeat(60))
