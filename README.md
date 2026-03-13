@@ -6,7 +6,7 @@ This repository provides tooling for deploying canonical helper contracts using 
 
 The deployment script uses the deterministic deployment proxy approach where:
 1. Pre-signed transactions are already prepared with specific signatures
-2. The script **automatically funds** the signer addresses with the required amount from your account
+2. The script **estimates actual gas cost** on the target L2 and funds deployer addresses with only what is needed (plus a configurable safety buffer)
 3. The script broadcasts the transactions using `cast publish`
 4. Contracts are deployed to their canonical, deterministic addresses
 
@@ -49,9 +49,37 @@ The repository includes a reproducible toolchain for pre-deploying canonical hel
 
 ## Usage
 
+### Gas Estimate (Pre-flight Check)
+
+Before sending any funds, run a gas estimate to see exactly how much ETH each deployer address needs on your target L2. No funder key required — this is read-only:
+
+```bash
+npm run deploy -- --gas-estimate --l2-rpc <url>
+```
+
+This will:
+- Simulate each deployment via `eth_estimateGas` to get actual expected gas usage
+- Check each deployer address nonce (warns if non-zero, meaning the pre-signed tx is unusable)
+- Show estimated cost vs hardcoded amount and expected leftover per contract
+- Works even if contracts are already deployed on the network
+
+Example output:
+
+```
+[L2] Running gas estimation...
+
+  CreateX (createx)
+    ✓ Already deployed at 0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed
+    Gas price (tx):  100.0 gwei
+    Gas limit (tx):  3,000,000
+    Estimated gas:   2,602,553 used
+    Estimated cost:  0.260255 ETH
+    Expected refund: 0.039745 ETH left in deployer after tx
+```
+
 ### Dry Run (Check Status)
 
-Check which contracts need funding and which are already deployed:
+Check which contracts need funding and which are already deployed, with no RPC calls:
 
 ```bash
 npm run deploy -- --dry-run
@@ -59,7 +87,7 @@ npm run deploy -- --dry-run
 
 ### Deploy All Contracts
 
-Deploy all supported contracts (the script will check funding and skip already deployed contracts):
+Deploy all supported contracts (the script will estimate gas, fund deployers with only what's needed, and skip already deployed contracts):
 
 ```bash
 npm run deploy -- --confirm
@@ -81,6 +109,18 @@ Available contract keys:
 - `createx`
 - `universal_deployer`
 
+### Adjusting the Gas Buffer
+
+By default the script adds a 20% buffer on top of the gas estimate when funding deployers. You can tune this with `--gas-buffer`:
+
+```bash
+# More conservative — 30% buffer
+npm run deploy -- --gas-buffer 30 --confirm
+
+# Tighter — 10% buffer
+npm run deploy -- --gas-buffer 10 --confirm
+```
+
 ### Interactive Mode
 
 If you omit `--confirm`, the script will ask for confirmation before proceeding:
@@ -99,17 +139,20 @@ Options:
   --contracts <list>          Comma-separated contract keys (defaults to all)
   --dry-run                   Print actions without broadcasting transactions
   --confirm                   Skip interactive confirmation prompt
+  --gas-estimate              Estimate actual gas costs on L2 and compare with hardcoded amounts (requires --l2-rpc)
+  --gas-buffer <percent>      Extra % added on top of gas estimate when funding deployer addresses (default: 20)
   -h, --help                  Display help
 ```
 
 ## How It Works
 
 1. **Check if already deployed**: The script checks if each contract already exists at its expected address
-2. **Check funding**: For contracts that need deployment, it verifies the funding address has sufficient balance
-3. **Auto-fund if needed**: If not funded, the script automatically sends the required amount from your funder account
-4. **Publish transaction**: Uses `cast publish` to broadcast the pre-signed transaction
-5. **Verify deployment**: Uses `cast code` to verify the contract was deployed to the correct address
-6. **Report results**: Shows which contracts were deployed, funded, verified, and which already existed
+2. **Estimate gas**: For contracts that need deployment, the script calls `eth_estimateGas` on the pre-signed transaction to determine how much ETH the deployer address actually needs on this specific L2
+3. **Calculate funding amount**: `fundingAmount = estimatedGas × txGasPrice × (1 + gasBuffer%)`. If estimation fails, falls back to the hardcoded maximum (gasLimit × gasPrice)
+4. **Top up deployer if needed**: If the deployer address balance is below the calculated amount, the funder sends only the difference
+5. **Publish transaction**: Uses `cast publish` to broadcast the pre-signed transaction
+6. **Verify deployment**: Uses `cast code` to verify the contract was deployed to the correct address
+7. **Report results**: Shows which contracts were deployed, funded, verified, and which already existed
 
 ## Example Output
 
@@ -165,20 +208,27 @@ DEPLOYMENT SUMMARY
 
 ## Automatic Funding
 
-The script automatically handles funding! When a deployment address doesn't have sufficient balance, the script will:
+The script automatically handles funding with gas-aware amounts. When a deployment address doesn't have sufficient balance, the script will:
 
-1. Detect the insufficient balance
-2. Send the exact required amount from your funder account
-3. Wait for the funding transaction to confirm
-4. Proceed to publish the pre-signed deployment transaction
+1. Call `eth_estimateGas` to simulate the deployment and get actual expected gas usage on this L2
+2. Calculate the funding amount: `estimatedGas × txGasPrice × (1 + gasBuffer%)`
+3. Send only the difference between what the deployer already holds and what it needs
+4. Wait for the funding transaction to confirm
+5. Proceed to publish the pre-signed deployment transaction
 
-No manual intervention needed - just make sure your funder account has enough balance to cover all required amounts.
+This means the deployer address receives only what it needs for the deployment rather than the hardcoded worst-case maximum, minimising leftover ETH in addresses with publicly known keys. If gas estimation fails for any reason, the script falls back to the hardcoded amount so the deployment is never blocked.
+
+No manual intervention needed — just make sure your funder account has enough balance to cover the estimates.
 
 ## Frequently Asked Questions
 
 ### What does the funder account pay for?
 
-Your funder account sends the exact amounts needed (0.01, 0.03, or 0.1 ETH) to specific deployment addresses. Those addresses then use that ETH to pay for gas when the pre-signed transactions are broadcast. Your account does NOT directly deploy the contracts - it just funds the special addresses that do.
+Your funder account tops up the deployer addresses so they can pay gas when the pre-signed transactions are broadcast. The script estimates actual gas cost on the target L2 and sends only that amount plus a buffer — not the hardcoded worst-case maximum. Your account does NOT directly deploy the contracts; it just funds the special deployer addresses that do.
+
+### What happens if a deployer address has a non-zero nonce?
+
+Each pre-signed transaction is signed with nonce 0. If a deployer address has already been used (nonce > 0), the pre-signed tx can never be broadcast and any ETH sent there would be stuck. The `--gas-estimate` flag checks every deployer nonce and warns loudly if any are non-zero before you send any funds.
 
 ### What if the contract is already deployed?
 
@@ -198,7 +248,7 @@ Yes! The script works with any EVM-compatible L2, including those using custom b
 
 ### Why these specific amounts (0.01, 0.03, 0.1 ETH)?
 
-These are the exact gas amounts required by the pre-signed transactions. They're fixed and cannot be changed - they're part of the deterministic deployment process that ensures the same addresses across all networks.
+Those are the hardcoded worst-case maximums baked into the pre-signed transactions (`gasLimit × gasPrice`). The script no longer sends those amounts blindly — it estimates actual gas usage on the target L2 first and only funds what is needed plus a buffer. On L2s, actual gas used is typically well below the limit, so the funder spends considerably less than the listed amounts.
 
 ## Custom Base Token Networks
 
