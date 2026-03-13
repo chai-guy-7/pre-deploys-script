@@ -219,34 +219,25 @@ async function gasEstimateOnL2(params: {
 
     // Check if already deployed
     const code = await provider.getCode(deployment.deployedAddress)
-    if (code !== '0x') {
+    const alreadyDeployed = code !== '0x'
+    if (alreadyDeployed) {
       console.log(`    ✓ Already deployed at ${deployment.deployedAddress}`)
-      results.push({
-        key: deployment.key,
-        label: deployment.label,
-        fundingAddress: deployment.fundingAddress,
-        hardcodedAmount: deployment.fundingAmount,
-        txGasPrice,
-        txGasLimit,
-        maxCost,
-        estimatedGasUsed: null,
-        estimatedCost: null,
-        expectedLeftover: null,
-        deployerNonce: -1,
-        alreadyDeployed: true
-      })
-      continue
     }
 
-    // Check deployer nonce — must be 0 or the pre-signed tx is unusable
+    // Check deployer nonce — must be 0 for the pre-signed tx to be usable.
+    // If the contract is already deployed the nonce will be >= 1, which is expected.
     const deployerNonce = await provider.getTransactionCount(deployment.fundingAddress)
-    if (deployerNonce !== 0) {
-      console.log(`    ⚠ WARNING: Deployer nonce is ${deployerNonce} (expected 0). Pre-signed tx cannot be broadcast!`)
-    } else {
-      console.log(`    ✓ Deployer nonce: 0`)
+    if (!alreadyDeployed) {
+      if (deployerNonce !== 0) {
+        console.log(`    ⚠ WARNING: Deployer nonce is ${deployerNonce} (expected 0). Pre-signed tx cannot be broadcast!`)
+      } else {
+        console.log(`    ✓ Deployer nonce: 0`)
+      }
     }
 
-    // Estimate gas usage by simulating the deployment call
+    // Estimate gas by simulating the deployment call.
+    // When already deployed the deployer nonce is >= 1, so the CREATE targets a
+    // fresh address — the simulation still succeeds and gives accurate gas figures.
     let estimatedGasUsed: bigint | null = null
     let estimateError: string | undefined
 
@@ -278,7 +269,7 @@ async function gasEstimateOnL2(params: {
       estimatedCost,
       expectedLeftover,
       deployerNonce,
-      alreadyDeployed: false,
+      alreadyDeployed,
       estimateError
     })
   }
@@ -494,38 +485,38 @@ async function main() {
       console.log(`  Funding address: ${est.fundingAddress}`)
 
       if (est.alreadyDeployed) {
-        console.log(`  Status:          ✓ Already deployed — no funding needed`)
-        continue
+        console.log(`  Status:          ✓ Already deployed`)
+      } else {
+        undeployedCount++
+        const hardcodedWei = parseEther(est.hardcodedAmount)
+        totalHardcoded += hardcodedWei
+        totalMaxCost += est.maxCost
+
+        const nonceStatus = est.deployerNonce === 0
+          ? '✓ 0 (valid)'
+          : `⚠ ${est.deployerNonce} — NONCE BURNED, pre-signed tx unusable!`
+        console.log(`  Deployer nonce:  ${nonceStatus}`)
+        console.log(`  Min to send:     ${formatEther(est.maxCost)} ETH  (gasPrice × gasLimit — node rejects tx if below this)`)
+        console.log(`  Hardcoded:       ${est.hardcodedAmount} ETH`)
+
+        const hardcodedOverage = hardcodedWei - est.maxCost
+        if (hardcodedOverage > BigInt(0)) {
+          console.log(`  Hardcoded overage: +${formatEther(hardcodedOverage)} ETH above min (wasted if sent as-is)`)
+        }
       }
 
-      undeployedCount++
-      const hardcodedWei = parseEther(est.hardcodedAmount)
-      totalHardcoded += hardcodedWei
-      totalMaxCost += est.maxCost
-
-      const nonceStatus = est.deployerNonce === 0
-        ? '✓ 0 (valid)'
-        : `⚠ ${est.deployerNonce} — NONCE BURNED, pre-signed tx unusable!`
-      console.log(`  Deployer nonce:  ${nonceStatus}`)
       console.log(`  Gas price (tx):  ${formatUnits(est.txGasPrice, 'gwei')} gwei`)
       console.log(`  Gas limit (tx):  ${est.txGasLimit.toLocaleString()}`)
-      console.log(`  Min to send:     ${formatEther(est.maxCost)} ETH  (gasPrice × gasLimit — node rejects tx if below this)`)
-      console.log(`  Hardcoded:       ${est.hardcodedAmount} ETH`)
-
-      const hardcodedOverage = hardcodedWei - est.maxCost
-      if (hardcodedOverage > BigInt(0)) {
-        console.log(`  Hardcoded overage: +${formatEther(hardcodedOverage)} ETH above min (wasted if sent as-is)`)
-      }
 
       if (est.estimatedGasUsed !== null && est.estimatedCost !== null && est.expectedLeftover !== null) {
-        totalEstimated += est.estimatedCost
+        if (!est.alreadyDeployed) totalEstimated += est.estimatedCost
         console.log(`  Estimated gas:   ${est.estimatedGasUsed.toLocaleString()} used`)
         console.log(`  Estimated cost:  ${formatEther(est.estimatedCost)} ETH`)
         console.log(`  Expected refund: ${formatEther(est.expectedLeftover)} ETH left in deployer after tx`)
       } else if (est.estimateError) {
-        totalEstimated += est.maxCost // fall back to max cost if estimation failed
+        if (!est.alreadyDeployed) totalEstimated += est.maxCost // fall back to max cost if estimation failed
         console.log(`  Gas estimate:    ⚠ Failed (${est.estimateError})`)
-        console.log(`  Recommendation:  Send min required (${formatEther(est.maxCost)} ETH)`)
+        if (!est.alreadyDeployed) console.log(`  Recommendation:  Send min required (${formatEther(est.maxCost)} ETH)`)
       }
     }
 
