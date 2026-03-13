@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { execSync } from 'node:child_process'
 import { Command } from 'commander'
 import { config as loadEnv } from 'dotenv'
-import { JsonRpcProvider, Wallet, parseEther } from 'ethers'
+import { JsonRpcProvider, Wallet, parseEther, Transaction, formatUnits } from 'ethers'
 
 loadEnv()
 
@@ -22,6 +22,23 @@ interface CliOptions {
   contracts?: string[]
   dryRun?: boolean
   confirm?: boolean
+  gasEstimate?: boolean
+}
+
+interface GasEstimateResult {
+  key: string
+  label: string
+  fundingAddress: string
+  hardcodedAmount: string
+  txGasPrice: bigint
+  txGasLimit: bigint
+  maxCost: bigint         // gasPrice * gasLimit — minimum balance required for the node to accept the tx
+  estimatedGasUsed: bigint | null
+  estimatedCost: bigint | null    // estimatedGasUsed * gasPrice — likely actual spend
+  expectedLeftover: bigint | null // maxCost - estimatedCost — refunded to deployer after tx
+  deployerNonce: number           // must be 0 for pre-signed tx to work
+  alreadyDeployed: boolean
+  estimateError?: string
 }
 
 interface DeploymentArtifact {
@@ -116,6 +133,7 @@ const program = new Command()
   .option('--contracts <list>', 'Comma-separated contract keys (defaults to all)', (value: string) => value.split(',').map(entry => entry.trim()).filter(Boolean))
   .option('--dry-run', 'Print actions without broadcasting transactions', false)
   .option('--confirm', 'Skip interactive confirmation prompt', false)
+  .option('--gas-estimate', 'Estimate actual gas costs on L2 and compare with hardcoded funding amounts (requires --l2-rpc)', false)
 
 program.parse(process.argv)
 const options = program.opts<CliOptions>()
@@ -125,12 +143,17 @@ if (!TARGETS.includes(options.target)) {
   process.exit(1)
 }
 
-if (!options.dryRun && !options.l2Rpc) {
+if (!options.dryRun && !options.gasEstimate && !options.l2Rpc) {
   console.error('Missing L2 RPC URL. Provide --l2-rpc or set L2_RPC_URL in .env.')
   process.exit(1)
 }
 
-if (!options.dryRun && !options.funderPrivateKey) {
+if (options.gasEstimate && !options.l2Rpc) {
+  console.error('--gas-estimate requires --l2-rpc.')
+  process.exit(1)
+}
+
+if (!options.dryRun && !options.gasEstimate && !options.funderPrivateKey) {
   console.error('Missing funder private key. Provide --funder-private-key or set FUNDER_PRIVATE_KEY in .env.')
   process.exit(1)
 }
@@ -173,6 +196,94 @@ function formatEther(wei: bigint): string {
   // Simple formatting: divide by 10^18 and show up to 6 decimals
   const ethValue = Number(wei) / 1e18
   return ethValue.toFixed(6)
+}
+
+async function gasEstimateOnL2(params: {
+  deployments: PreSignedDeployment[]
+  rpcUrl: string
+}): Promise<GasEstimateResult[]> {
+  const { deployments, rpcUrl } = params
+  const provider = new JsonRpcProvider(rpcUrl)
+  const results: GasEstimateResult[] = []
+
+  console.log('\n[L2] Running gas estimation...')
+
+  for (const deployment of deployments) {
+    console.log(`\n  ${deployment.label}`)
+
+    // Decode the pre-signed transaction to extract gas parameters
+    const parsedTx = Transaction.from(deployment.rawTransaction)
+    const txGasPrice = parsedTx.gasPrice ?? BigInt(0)
+    const txGasLimit = BigInt(parsedTx.gasLimit)
+    const maxCost = txGasPrice * txGasLimit
+
+    // Check if already deployed
+    const code = await provider.getCode(deployment.deployedAddress)
+    if (code !== '0x') {
+      console.log(`    ✓ Already deployed at ${deployment.deployedAddress}`)
+      results.push({
+        key: deployment.key,
+        label: deployment.label,
+        fundingAddress: deployment.fundingAddress,
+        hardcodedAmount: deployment.fundingAmount,
+        txGasPrice,
+        txGasLimit,
+        maxCost,
+        estimatedGasUsed: null,
+        estimatedCost: null,
+        expectedLeftover: null,
+        deployerNonce: -1,
+        alreadyDeployed: true
+      })
+      continue
+    }
+
+    // Check deployer nonce — must be 0 or the pre-signed tx is unusable
+    const deployerNonce = await provider.getTransactionCount(deployment.fundingAddress)
+    if (deployerNonce !== 0) {
+      console.log(`    ⚠ WARNING: Deployer nonce is ${deployerNonce} (expected 0). Pre-signed tx cannot be broadcast!`)
+    } else {
+      console.log(`    ✓ Deployer nonce: 0`)
+    }
+
+    // Estimate gas usage by simulating the deployment call
+    let estimatedGasUsed: bigint | null = null
+    let estimateError: string | undefined
+
+    try {
+      estimatedGasUsed = await provider.estimateGas({
+        from: deployment.fundingAddress,
+        data: parsedTx.data,
+        value: parsedTx.value
+      })
+      console.log(`    Gas limit (tx):    ${txGasLimit.toLocaleString()}`)
+      console.log(`    Estimated gas:     ${estimatedGasUsed.toLocaleString()} (${((Number(estimatedGasUsed) / Number(txGasLimit)) * 100).toFixed(1)}% of limit)`)
+    } catch (err: any) {
+      estimateError = err.message
+      console.log(`    ⚠ Gas estimation failed: ${err.message}`)
+    }
+
+    const estimatedCost = estimatedGasUsed !== null ? estimatedGasUsed * txGasPrice : null
+    const expectedLeftover = estimatedCost !== null ? maxCost - estimatedCost : null
+
+    results.push({
+      key: deployment.key,
+      label: deployment.label,
+      fundingAddress: deployment.fundingAddress,
+      hardcodedAmount: deployment.fundingAmount,
+      txGasPrice,
+      txGasLimit,
+      maxCost,
+      estimatedGasUsed,
+      estimatedCost,
+      expectedLeftover,
+      deployerNonce,
+      alreadyDeployed: false,
+      estimateError
+    })
+  }
+
+  return results
 }
 
 async function deployOnL2(params: {
@@ -352,6 +463,7 @@ async function main() {
   console.log(`  Target: ${options.target}`)
   console.log(`  L2 RPC: ${options.l2Rpc ?? 'n/a'}`)
   console.log(`  Dry run: ${options.dryRun ? 'yes' : 'no'}`)
+  console.log(`  Gas estimate: ${options.gasEstimate ? 'yes' : 'no'}`)
 
   console.log('\nContracts to deploy:')
   for (const deployment of deployments) {
@@ -359,6 +471,81 @@ async function main() {
     console.log(`    Expected address: ${deployment.deployedAddress}`)
     console.log(`    Funding address:  ${deployment.fundingAddress}`)
     console.log(`    Required amount:  ${deployment.fundingAmount} ETH`)
+  }
+
+  // Gas estimate mode: connect to L2, estimate actual costs, check deployer nonces
+  if (options.gasEstimate) {
+    const estimates = await gasEstimateOnL2({
+      deployments,
+      rpcUrl: options.l2Rpc!
+    })
+
+    console.log('\n' + '='.repeat(80))
+    console.log('GAS ESTIMATE SUMMARY')
+    console.log('='.repeat(80))
+
+    let totalHardcoded = BigInt(0)
+    let totalMaxCost = BigInt(0)
+    let totalEstimated = BigInt(0)
+    let undeployedCount = 0
+
+    for (const est of estimates) {
+      console.log(`\n${est.label} (${est.key})`)
+      console.log(`  Funding address: ${est.fundingAddress}`)
+
+      if (est.alreadyDeployed) {
+        console.log(`  Status:          ✓ Already deployed — no funding needed`)
+        continue
+      }
+
+      undeployedCount++
+      const hardcodedWei = parseEther(est.hardcodedAmount)
+      totalHardcoded += hardcodedWei
+      totalMaxCost += est.maxCost
+
+      const nonceStatus = est.deployerNonce === 0
+        ? '✓ 0 (valid)'
+        : `⚠ ${est.deployerNonce} — NONCE BURNED, pre-signed tx unusable!`
+      console.log(`  Deployer nonce:  ${nonceStatus}`)
+      console.log(`  Gas price (tx):  ${formatUnits(est.txGasPrice, 'gwei')} gwei`)
+      console.log(`  Gas limit (tx):  ${est.txGasLimit.toLocaleString()}`)
+      console.log(`  Min to send:     ${formatEther(est.maxCost)} ETH  (gasPrice × gasLimit — node rejects tx if below this)`)
+      console.log(`  Hardcoded:       ${est.hardcodedAmount} ETH`)
+
+      const hardcodedOverage = hardcodedWei - est.maxCost
+      if (hardcodedOverage > BigInt(0)) {
+        console.log(`  Hardcoded overage: +${formatEther(hardcodedOverage)} ETH above min (wasted if sent as-is)`)
+      }
+
+      if (est.estimatedGasUsed !== null && est.estimatedCost !== null && est.expectedLeftover !== null) {
+        totalEstimated += est.estimatedCost
+        console.log(`  Estimated gas:   ${est.estimatedGasUsed.toLocaleString()} used`)
+        console.log(`  Estimated cost:  ${formatEther(est.estimatedCost)} ETH`)
+        console.log(`  Expected refund: ${formatEther(est.expectedLeftover)} ETH left in deployer after tx`)
+      } else if (est.estimateError) {
+        totalEstimated += est.maxCost // fall back to max cost if estimation failed
+        console.log(`  Gas estimate:    ⚠ Failed (${est.estimateError})`)
+        console.log(`  Recommendation:  Send min required (${formatEther(est.maxCost)} ETH)`)
+      }
+    }
+
+    if (undeployedCount > 0) {
+      console.log('\n' + '-'.repeat(80))
+      console.log('TOTALS (undeployed contracts only)')
+      console.log(`  Hardcoded total:   ${formatEther(totalHardcoded)} ETH`)
+      console.log(`  Min required:      ${formatEther(totalMaxCost)} ETH  (sum of gasPrice × gasLimit per tx)`)
+      if (totalEstimated > BigInt(0)) {
+        console.log(`  Estimated actual:  ${formatEther(totalEstimated)} ETH  (likely spend based on gas estimation)`)
+      }
+      const hardcodedSavings = totalHardcoded - totalMaxCost
+      if (hardcodedSavings > BigInt(0)) {
+        console.log(`  Overfunding:       ${formatEther(hardcodedSavings)} ETH above min (hardcoded vs actual minimum)`)
+      }
+      console.log('\nNote: Send at least "min required" per deployer address. Unused gas is refunded')
+      console.log('      to the deployer address after deployment, not back to the funder.')
+    }
+
+    return
   }
 
   if (!options.confirm && !options.dryRun) {
